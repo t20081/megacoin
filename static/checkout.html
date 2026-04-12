@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MegaCoin Checkout</title>
+  <style>
+    :root {
+      --bg: #f6fbff;
+      --panel: rgba(255,255,255,0.9);
+      --ink: #15202b;
+      --line: rgba(21,32,43,0.1);
+      --accent: #0b8f87;
+      --warn: #d97706;
+      --danger: #c2410c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Book Antiqua", Georgia, serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top, rgba(11,143,135,0.16), transparent 25%),
+        linear-gradient(180deg, #f8fcff, #edf7f6);
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 20px;
+    }
+    .card {
+      width: min(760px, 100%);
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      padding: 28px;
+      box-shadow: 0 24px 60px rgba(21,32,43,0.08);
+      display: grid;
+      grid-template-columns: 1fr 0.9fr;
+      gap: 24px;
+    }
+    h1, h2 { margin: 0 0 12px; }
+    .qr {
+      background: white;
+      border-radius: 20px;
+      padding: 14px;
+      min-height: 220px;
+      min-width: 220px;
+    }
+    .pill {
+      display: inline-block;
+      padding: 7px 12px;
+      border-radius: 999px;
+      font-weight: 700;
+      text-transform: uppercase;
+      font-size: 0.78rem;
+      letter-spacing: 0.08em;
+    }
+    .pending { background: rgba(217,119,6,0.14); color: var(--warn); }
+    .paid { background: rgba(11,143,135,0.14); color: var(--accent); }
+    .expired { background: rgba(194,65,12,0.12); color: var(--danger); }
+    .mono { font-family: "Courier New", monospace; word-break: break-all; }
+    .status { margin-top: 12px; }
+    @media (max-width: 820px) {
+      .card { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <section>
+      <div id="statusPill" class="pill pending">Loading</div>
+      <h1 id="title">Loading invoice...</h1>
+      <p id="description"></p>
+      <h2 id="amount"></h2>
+      <p>Reference: <span id="reference" class="mono"></span></p>
+      <p>Merchant: <span id="address" class="mono"></span></p>
+      <div class="status">
+        <p>Time left: <strong id="timeLeft">-</strong></p>
+        <p>Confirmations: <strong id="confirmations">0</strong></p>
+        <p>Matched amount: <strong id="matchedAmount">0</strong></p>
+      </div>
+    </section>
+    <section>
+      <div id="qr" class="qr"></div>
+      <p>Payment URI</p>
+      <div id="paymentUri" class="mono"></div>
+      <p id="stateMessage"></p>
+    </section>
+  </div>
+
+  <script>
+    const invoiceId = window.location.pathname.split("/").pop();
+
+    function setPill(status) {
+      const pill = document.getElementById("statusPill");
+      pill.textContent = status;
+      pill.className = `pill ${status}`;
+    }
+
+    async function loadInvoice() {
+      const response = await fetch(`/merchant/invoices/${invoiceId}`);
+      const invoice = await response.json();
+      if (!response.ok) {
+        document.getElementById("title").textContent = invoice.error || "Invoice not found";
+        return null;
+      }
+      document.getElementById("title").textContent = `Invoice ${invoice.invoice_id}`;
+      document.getElementById("description").textContent = invoice.description || "MegaCoin payment request";
+      document.getElementById("amount").textContent = `${Number(invoice.amount).toFixed(8)} MGC`;
+      document.getElementById("reference").textContent = invoice.reference;
+      document.getElementById("address").textContent = invoice.merchant_address;
+      document.getElementById("paymentUri").textContent = invoice.payment_uri;
+      setPill(invoice.status);
+      return invoice;
+    }
+
+    async function loadQr(text) {
+      const response = await fetch(`/qr?text=${encodeURIComponent(text)}`);
+      document.getElementById("qr").innerHTML = await response.text();
+    }
+
+    async function pollStatus() {
+      const response = await fetch(`/merchant/status/${invoiceId}`);
+      const status = await response.json();
+      if (!response.ok) return;
+      setPill(status.status);
+      document.getElementById("timeLeft").textContent = `${status.time_left}s`;
+      document.getElementById("confirmations").textContent = `${status.confirmations}/${status.confirmations_required}`;
+      document.getElementById("matchedAmount").textContent = `${Number(status.matched_amount).toFixed(8)} MGC`;
+      const message = document.getElementById("stateMessage");
+      if (status.status === "paid") {
+        message.textContent = "Payment confirmed. Thank you.";
+      } else if (status.status === "expired") {
+        message.textContent = "This invoice has expired.";
+      } else if (status.tx_id) {
+        message.textContent = "Payment detected. Waiting for confirmation.";
+      } else {
+        message.textContent = "Awaiting MegaCoin payment.";
+      }
+    }
+
+    (async () => {
+      const invoice = await loadInvoice();
+      if (invoice) {
+        await loadQr(invoice.payment_uri);
+        await pollStatus();
+        setInterval(pollStatus, 3000);
+      }
+    })();
+  </script>
+</body>
+</html>

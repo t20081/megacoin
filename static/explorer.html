@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MegaCoin Explorer</title>
+  <style>
+    :root {
+      --bg: #0f1720;
+      --panel: rgba(255,255,255,0.08);
+      --line: rgba(255,255,255,0.12);
+      --text: #eff5ef;
+      --muted: rgba(239,245,239,0.72);
+      --accent: #ffd166;
+      --accent-2: #58d6b1;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Trebuchet MS", Verdana, sans-serif;
+      background:
+        radial-gradient(circle at top right, rgba(255,209,102,0.18), transparent 24%),
+        radial-gradient(circle at left center, rgba(88,214,177,0.12), transparent 24%),
+        linear-gradient(180deg, #0b1117, #131f2c);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    .wrap { max-width: 1160px; margin: 0 auto; padding: 28px 18px 60px; }
+    .top { display: grid; grid-template-columns: 1fr auto; gap: 16px; align-items: center; }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      padding: 20px;
+      backdrop-filter: blur(8px);
+      box-shadow: 0 18px 60px rgba(0,0,0,0.24);
+    }
+    h1 { font-size: clamp(2rem, 5vw, 4rem); margin: 0; }
+    .subtle { color: var(--muted); }
+    .stats, .results { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-top: 20px; }
+    input, button {
+      width: 100%;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      padding: 12px 14px;
+      font: inherit;
+      background: rgba(255,255,255,0.06);
+      color: var(--text);
+    }
+    button {
+      background: linear-gradient(135deg, var(--accent), #ff9f1c);
+      color: #1b1b1b;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .search {
+      display: grid;
+      grid-template-columns: 1fr 1fr auto;
+      gap: 12px;
+      margin-top: 20px;
+    }
+    .list { margin-top: 18px; display: grid; gap: 14px; }
+    .mono { font-family: "Courier New", monospace; word-break: break-all; }
+    @media (max-width: 840px) {
+      .top, .search { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="top">
+      <div>
+        <div class="subtle">MegaCoin Explorer</div>
+        <h1>Watch the chain move.</h1>
+      </div>
+      <div class="panel">
+        <div id="chainMeta">Loading chain data...</div>
+      </div>
+    </section>
+
+    <section class="stats">
+      <div class="panel"><div class="subtle">Blocks</div><div id="blockCount"></div></div>
+      <div class="panel"><div class="subtle">Pending</div><div id="pendingCount"></div></div>
+      <div class="panel"><div class="subtle">Latest Hash</div><div id="latestHash" class="mono"></div></div>
+    </section>
+
+    <section class="panel" style="margin-top:20px;">
+      <h2>Search Transactions</h2>
+      <div class="search">
+        <input id="address" placeholder="Address">
+        <input id="reference" placeholder="Reference or invoice id">
+        <button id="search">Search</button>
+      </div>
+      <div id="results" class="list"></div>
+    </section>
+
+    <section class="panel" style="margin-top:20px;">
+      <h2>Recent Blocks</h2>
+      <div id="blocks" class="list"></div>
+    </section>
+  </div>
+
+  <script>
+    function blockCard(block) {
+      return `
+        <article class="panel">
+          <div class="subtle">Block #${block.index}</div>
+          <div class="mono">${block.hash}</div>
+          <p>Validator: <span class="mono">${block.validator}</span></p>
+          <p>${block.transaction_count} transaction(s)</p>
+        </article>
+      `;
+    }
+
+    function txCard(item) {
+      const tx = item.transaction;
+      return `
+        <article class="panel">
+          <div class="subtle">Transaction</div>
+          <div class="mono">${item.tx_id}</div>
+          <p>From <span class="mono">${tx.sender}</span></p>
+          <p>To <span class="mono">${tx.recipient}</span></p>
+          <p>Amount: ${Number(tx.amount).toFixed(8)} MGC</p>
+          <p>Reference: ${tx.reference || "-"}</p>
+          <p>Confirmations: ${item.confirmations}</p>
+        </article>
+      `;
+    }
+
+    async function loadSummary() {
+      const response = await fetch("/explorer/summary");
+      const payload = await response.json();
+      document.getElementById("blockCount").textContent = payload.status.blocks;
+      document.getElementById("pendingCount").textContent = payload.status.pending_transactions;
+      document.getElementById("latestHash").textContent = payload.status.latest_hash;
+      document.getElementById("chainMeta").textContent = `${payload.status.blocks} blocks on MegaCoin Proof of Stake`;
+      document.getElementById("blocks").innerHTML = payload.recent_blocks.map(blockCard).join("");
+    }
+
+    document.getElementById("search").addEventListener("click", async () => {
+      const address = document.getElementById("address").value.trim();
+      const reference = document.getElementById("reference").value.trim();
+      const params = new URLSearchParams();
+      if (address) params.set("address", address);
+      if (reference) params.set("reference", reference);
+      const response = await fetch(`/explorer/search?${params.toString()}`);
+      const payload = await response.json();
+      const results = document.getElementById("results");
+      if (!payload.results.length) {
+        results.innerHTML = `<div class="subtle">No matching transactions found.</div>`;
+        return;
+      }
+      results.innerHTML = payload.results.map(txCard).join("");
+    });
+
+    loadSummary();
+  </script>
+</body>
+</html>

@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MegaCoin Merchant Dashboard</title>
+  <style>
+    :root {
+      --bg: #fff8ef;
+      --panel: rgba(255,255,255,0.84);
+      --ink: #1a1b26;
+      --line: rgba(26,27,38,0.1);
+      --accent: #c8553d;
+      --accent-2: #1e847f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Palatino Linotype", Georgia, serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(200,85,61,0.18), transparent 28%),
+        radial-gradient(circle at right bottom, rgba(30,132,127,0.16), transparent 26%),
+        linear-gradient(135deg, #fef7ea, #f0f7f4);
+      min-height: 100vh;
+    }
+    .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 18px 60px; }
+    .hero, .grid { display: grid; gap: 18px; }
+    .hero { grid-template-columns: 1.2fr 0.8fr; }
+    .grid { grid-template-columns: 0.9fr 1.1fr; margin-top: 18px; }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      padding: 22px;
+      box-shadow: 0 18px 45px rgba(26,27,38,0.08);
+      backdrop-filter: blur(10px);
+    }
+    h1, h2, h3 { margin: 0 0 12px; }
+    h1 { font-size: clamp(2.2rem, 5vw, 4.3rem); line-height: 0.96; }
+    input, textarea, button {
+      width: 100%;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      padding: 12px 14px;
+      font: inherit;
+      background: rgba(255,255,255,0.92);
+    }
+    textarea { min-height: 88px; resize: vertical; }
+    button {
+      background: linear-gradient(135deg, var(--accent), #ef8354);
+      color: white;
+      border: 0;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button.alt { background: linear-gradient(135deg, var(--accent-2), #2db5a8); }
+    label { display: block; margin: 12px 0 8px; font-size: 0.92rem; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .list { display: grid; gap: 14px; }
+    .invoice { border: 1px solid var(--line); border-radius: 18px; padding: 16px; background: rgba(255,255,255,0.65); }
+    .mono { font-family: "Courier New", monospace; word-break: break-all; }
+    .pill { display: inline-block; padding: 6px 10px; border-radius: 999px; font-size: 0.8rem; font-weight: 700; }
+    .pending { background: rgba(230,152,0,0.12); color: #af6700; }
+    .paid { background: rgba(30,132,127,0.14); color: #176660; }
+    .expired { background: rgba(184,41,65,0.12); color: #9a1e34; }
+    .status { min-height: 22px; margin-top: 10px; color: var(--accent-2); }
+    @media (max-width: 900px) {
+      .hero, .grid, .row { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="hero">
+      <div class="card">
+        <div>MegaCoin Merchant</div>
+        <h1>Create invoices and watch payments land.</h1>
+        <p>Build checkout requests, share QR-backed invoice pages, and monitor live payment status from this dashboard.</p>
+      </div>
+      <div class="card">
+        <div>Tips</div>
+        <p>Use a dedicated merchant wallet address, set a clear invoice description, and choose a short timeout for one-time checkout sessions.</p>
+      </div>
+    </section>
+
+    <section class="grid">
+      <article class="card">
+        <h2>New Invoice</h2>
+        <label for="merchantAddress">Merchant Address</label>
+        <input id="merchantAddress" placeholder="MGC...">
+        <div class="row">
+          <div>
+            <label for="amount">Amount</label>
+            <input id="amount" type="number" min="0" step="0.00000001" placeholder="5">
+          </div>
+          <div>
+            <label for="expiresIn">Expires In (seconds)</label>
+            <input id="expiresIn" type="number" min="1" value="900">
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <label for="reference">Reference</label>
+            <input id="reference" placeholder="order-1001">
+          </div>
+          <div>
+            <label for="confirmations">Confirmations Required</label>
+            <input id="confirmations" type="number" min="1" value="1">
+          </div>
+        </div>
+        <label for="description">Description</label>
+        <textarea id="description" placeholder="Premium plan order"></textarea>
+        <button id="createInvoice">Create Invoice</button>
+        <div id="createStatus" class="status"></div>
+      </article>
+
+      <article class="card">
+        <div style="display:flex; justify-content:space-between; gap:12px; align-items:center;">
+          <h2>Invoices</h2>
+          <button id="refresh" class="alt" style="width:auto; padding:10px 16px;">Refresh</button>
+        </div>
+        <div id="invoiceList" class="list"></div>
+      </article>
+    </section>
+  </div>
+
+  <script>
+    function pillClass(status) {
+      if (status === "paid") return "pill paid";
+      if (status === "expired") return "pill expired";
+      return "pill pending";
+    }
+
+    function renderInvoice(invoice) {
+      return `
+        <article class="invoice">
+          <div style="display:flex; justify-content:space-between; gap:12px; align-items:center; flex-wrap:wrap;">
+            <strong>${invoice.description || "Untitled invoice"}</strong>
+            <span class="${pillClass(invoice.status)}">${invoice.status}</span>
+          </div>
+          <p><strong>${Number(invoice.amount).toFixed(8)} MGC</strong></p>
+          <p>Reference: <span class="mono">${invoice.reference}</span></p>
+          <p>Checkout: <a href="${invoice.checkout_url}" target="_blank">${invoice.checkout_url}</a></p>
+          <p>Time left: ${invoice.status_snapshot.time_left}s</p>
+          <p>Matched: ${Number(invoice.matched_amount).toFixed(8)} MGC</p>
+          <p>Confirmations: ${invoice.confirmations}/${invoice.confirmations_required}</p>
+          <div style="display:flex; gap:10px; flex-wrap:wrap;">
+            <button onclick="window.open('${invoice.checkout_url}', '_blank')">Open Checkout</button>
+            <button class="alt" onclick="expireInvoice('${invoice.invoice_id}')">Expire</button>
+          </div>
+        </article>
+      `;
+    }
+
+    async function loadInvoices() {
+      const response = await fetch("/merchant/invoices");
+      const payload = await response.json();
+      const list = document.getElementById("invoiceList");
+      if (!payload.invoices.length) {
+        list.innerHTML = `<div>No invoices yet.</div>`;
+        return;
+      }
+      list.innerHTML = payload.invoices.map(renderInvoice).join("");
+    }
+
+    async function expireInvoice(invoiceId) {
+      const response = await fetch(`/merchant/invoices/${invoiceId}/expire`, { method: "POST" });
+      const payload = await response.json();
+      if (!response.ok) {
+        document.getElementById("createStatus").textContent = payload.error || "Unable to expire invoice.";
+        return;
+      }
+      document.getElementById("createStatus").textContent = `Invoice ${invoiceId} updated to ${payload.status}.`;
+      loadInvoices();
+    }
+    window.expireInvoice = expireInvoice;
+
+    document.getElementById("createInvoice").addEventListener("click", async () => {
+      const payload = {
+        merchant_address: document.getElementById("merchantAddress").value.trim(),
+        amount: Number(document.getElementById("amount").value),
+        expires_in: Number(document.getElementById("expiresIn").value),
+        reference: document.getElementById("reference").value.trim(),
+        description: document.getElementById("description").value.trim(),
+        confirmations_required: Number(document.getElementById("confirmations").value)
+      };
+      const response = await fetch("/merchant/invoices", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const invoice = await response.json();
+      const status = document.getElementById("createStatus");
+      if (!response.ok) {
+        status.textContent = invoice.error || "Unable to create invoice.";
+        return;
+      }
+      status.innerHTML = `Invoice created. <a href="${invoice.checkout_url}" target="_blank">Open checkout</a>`;
+      loadInvoices();
+    });
+
+    document.getElementById("refresh").addEventListener("click", loadInvoices);
+    loadInvoices();
+    setInterval(loadInvoices, 5000);
+  </script>
+</body>
+</html>
