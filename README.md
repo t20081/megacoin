@@ -5,12 +5,16 @@ This project is a small educational MegaCoin prototype written in pure Python.
 It includes:
 
 - wallets signed with ECDSA on `secp256k1`
+- user accounts with login/register sessions
+- bcrypt-hardened auth sessions
+- SQLite-backed users, wallets, sessions, transaction history, and blockchain state snapshots
 - signed transactions with merchant `reference` fields
 - Proof of Stake validator selection
 - REST endpoints for transactions, balances, staking, forging, invoices, and peer sync
 - simple peer discovery, peer message validation, and basic anti-spam protection
 - a CLI wallet with `receive`, `send`, and `balance` commands
 - a hosted web wallet UI with QR codes
+- WebSocket live transaction and block feed
 - a hosted blockchain explorer web app
 
 ## Install dependencies
@@ -42,6 +46,21 @@ Open the browser apps:
 - Wallet UI: `http://127.0.0.1:8000/wallet`
 - Merchant Dashboard: `http://127.0.0.1:8000/merchant`
 - Explorer: `http://127.0.0.1:8000/explorer`
+
+## User API
+
+- `POST /register`
+- `POST /login`
+- `POST /logout`
+- `GET /session`
+- `GET /me/wallet`
+- `GET /me/history`
+- `POST /me/send`
+
+## Live Feed
+
+- `GET /status` returns `websocket_port`
+- wallet UI subscribes to the live WebSocket feed for transaction/block updates
 
 ## CLI wallet
 

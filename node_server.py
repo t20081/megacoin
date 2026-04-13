@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import argparse
 import json
 import threading
@@ -10,16 +11,20 @@ import urllib.request
 import uuid
 from collections import defaultdict, deque
 from http import HTTPStatus
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
 
 import segno
+from websockets.asyncio.server import serve as websocket_serve
 
+from auth_store import AuthStore, DATABASE_PATH as AUTH_DATABASE_PATH, SESSION_TTL_SECONDS
 from crypto_system import Block, Blockchain, Transaction, Wallet
 
 
 STATIC_DIR = Path(__file__).with_name("static")
+DATABASE_PATH = AUTH_DATABASE_PATH
 ALLOWED_MESSAGE_TYPES = {"transaction", "block", "stake", "peer-discovery"}
 INVOICE_PENDING = "pending"
 INVOICE_PAID = "paid"
@@ -37,8 +42,74 @@ def http_json(url: str, method: str = "GET", payload: dict[str, Any] | None = No
     return json.loads(body) if body else {}
 
 
+class LiveFeedServer:
+    def __init__(self, host: str, port: int = 0) -> None:
+        self.host = host
+        self.port = port
+        self.actual_port = 0
+        self.loop = asyncio.new_event_loop()
+        self.thread: Optional[threading.Thread] = None
+        self.server = None
+        self.clients: set[Any] = set()
+        self.started = threading.Event()
+
+    async def _handler(self, websocket) -> None:
+        self.clients.add(websocket)
+        try:
+            await websocket.send(json.dumps({"event": "connected"}))
+            async for _ in websocket:
+                pass
+        finally:
+            self.clients.discard(websocket)
+
+    async def _broadcast(self, message: dict[str, Any]) -> None:
+        if not self.clients:
+            return
+        payload = json.dumps(message)
+        stale = []
+        for client in list(self.clients):
+            try:
+                await client.send(payload)
+            except Exception:
+                stale.append(client)
+        for client in stale:
+            self.clients.discard(client)
+
+    def broadcast(self, message: dict[str, Any]) -> None:
+        if not self.started.is_set():
+            return
+        asyncio.run_coroutine_threadsafe(self._broadcast(message), self.loop)
+
+    async def _start(self) -> None:
+        self.server = await websocket_serve(self._handler, self.host, self.port)
+        socket = self.server.sockets[0]
+        self.actual_port = socket.getsockname()[1]
+        self.started.set()
+        await self.server.wait_closed()
+
+    def start(self) -> None:
+        if self.thread is not None:
+            return
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        self.started.wait(timeout=5)
+
+    def _run(self) -> None:
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_until_complete(self._start())
+
+    def stop(self) -> None:
+        if self.server is None:
+            return
+        self.loop.call_soon_threadsafe(self.server.close)
+        if self.thread is not None:
+            self.thread.join(timeout=2)
+            self.thread = None
+        self.loop.close()
+
+
 class Node:
-    def __init__(self, host: str = "127.0.0.1", port: int = 8000) -> None:
+    def __init__(self, host: str = "127.0.0.1", port: int = 8000, db_path: Path = DATABASE_PATH) -> None:
         self.blockchain = Blockchain()
         self.host = host
         self.port = port
@@ -48,6 +119,20 @@ class Node:
         self.rate_limits: dict[tuple[str, str], deque[float]] = defaultdict(deque)
         self.seen_messages: dict[str, float] = {}
         self.invoices: dict[str, dict[str, Any]] = {}
+        self.auth = AuthStore(self.blockchain, db_path=db_path)
+        _, invoice_state = self.auth.load_chain_state()
+        self.invoices = invoice_state
+        self.live_feed = LiveFeedServer(host, 0)
+
+    def websocket_url(self) -> str:
+        port = self.live_feed.actual_port
+        return f"ws://{self.host}:{port}"
+
+    def persist_state(self) -> None:
+        self.auth.save_chain_state(self.blockchain.to_dict(), self.invoices)
+
+    def publish_event(self, event: str, payload: dict[str, Any]) -> None:
+        self.live_feed.broadcast({"event": event, "payload": payload, "timestamp": time.time()})
 
     def set_public_url(self, host: str, port: int) -> None:
         self.host = host
@@ -76,12 +161,14 @@ class Node:
         wallet = Wallet.from_public_record(payload)
         with self.lock:
             self.blockchain.register_wallet(wallet)
+            self.persist_state()
         return wallet.to_public_record()
 
     def create_wallet(self, owner: str) -> dict[str, Any]:
         wallet = Wallet.create(owner)
         with self.lock:
             self.blockchain.register_wallet(wallet)
+            self.persist_state()
         return {
             "owner": wallet.owner,
             "address": wallet.address,
@@ -89,11 +176,40 @@ class Node:
             "private_key_hex": wallet.private_key_hex,
         }
 
+    def create_user(self, username: str, password: str) -> dict[str, Any]:
+        result = self.auth.create_user(username, password)
+        result["wallet"] = self.auth.wallet_payload(result["user"]["id"])
+        self.persist_state()
+        return result
+
+    def authenticate_user(self, username: str, password: str) -> dict[str, Any]:
+        result = self.auth.authenticate_user(username, password)
+        result["wallet"] = self.auth.wallet_payload(result["user"]["id"])
+        return result
+
+    def get_user_from_session(self, token: str) -> Optional[dict[str, Any]]:
+        return self.auth.user_from_session(token)
+
+    def destroy_session(self, token: str) -> None:
+        self.auth.destroy_session(token)
+
+    def wallet_payload(self, user_id: int) -> dict[str, Any]:
+        return self.auth.wallet_payload(user_id)
+
+    def history_for_user(self, user_id: int) -> list[dict[str, Any]]:
+        return self.auth.history_for_user(user_id)
+
+    def register_user_wallet_if_missing(self, user_id: int) -> None:
+        self.auth.register_wallet_if_missing(user_id)
+
     def submit_transaction(self, payload: dict[str, Any]) -> dict[str, Any]:
         transaction = Transaction.from_dict(payload)
         with self.lock:
             self.blockchain.create_transaction(transaction)
             self.refresh_invoice_states()
+            self.auth.rebuild_transaction_history()
+            self.persist_state()
+        self.publish_event("transaction", {"tx_id": transaction.tx_id(), "reference": transaction.reference})
         self.broadcast("transaction", transaction.to_dict())
         return {"status": "accepted", "tx_id": transaction.tx_id()}
 
@@ -113,9 +229,16 @@ class Node:
         transaction.sign(wallet)
         return self.submit_transaction(transaction.to_dict())
 
+    def me_send(self, user_id: int, recipient: str, amount: float, reference: str = "") -> dict[str, Any]:
+        wallet = self.auth.wallet_for_user(user_id)
+        transaction = Transaction(sender=wallet.address, recipient=recipient, amount=amount, reference=reference)
+        transaction.sign(wallet)
+        return self.submit_transaction(transaction.to_dict())
+
     def add_stake(self, address: str, amount: float) -> float:
         with self.lock:
             total = self.blockchain.add_stake(address, amount)
+            self.persist_state()
         self.broadcast("stake", {"address": address, "amount": amount})
         return total
 
@@ -123,6 +246,9 @@ class Node:
         with self.lock:
             block = self.blockchain.forge_pending_transactions()
             self.refresh_invoice_states()
+            self.auth.rebuild_transaction_history()
+            self.persist_state()
+        self.publish_event("block", {"index": block.index, "hash": block.hash})
         self.broadcast("block", {"block": block.to_dict()})
         return block.to_dict()
 
@@ -171,6 +297,8 @@ class Node:
                     if address not in self.blockchain.wallet_registry:
                         self.blockchain.register_wallet(wallet)
                 self.refresh_invoice_states()
+                self.auth.rebuild_transaction_history()
+                self.persist_state()
         return replaced
 
     def build_message(self, message_type: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -246,6 +374,8 @@ class Node:
             "payment_received_at": None,
         }
         self.invoices[invoice_id] = invoice
+        self.persist_state()
+        self.publish_event("invoice", {"invoice_id": invoice_id, "status": invoice["status"]})
         return self.serialize_invoice(invoice)
 
     def invoice_status_snapshot(self, invoice: dict[str, Any]) -> dict[str, Any]:
@@ -353,12 +483,15 @@ class Node:
         if invoice["status"] != INVOICE_PAID:
             invoice["expires_at"] = time.time() - 1
             self.refresh_invoice_states()
+            self.persist_state()
+            self.publish_event("invoice", {"invoice_id": invoice_id, "status": invoice["status"]})
         return self.serialize_invoice(invoice)
 
     def get_invoice(self, invoice_id: str) -> dict[str, Any]:
         if invoice_id not in self.invoices:
             raise ValueError("Invoice not found.")
         self.refresh_invoice_states()
+        self.persist_state()
         return self.serialize_invoice(self.invoices[invoice_id])
 
     def qr_svg(self, text: str) -> bytes:
@@ -367,6 +500,20 @@ class Node:
 
 
 class MegaCoinHandler(BaseHTTPRequestHandler):
+    def current_user(self) -> Optional[dict[str, Any]]:
+        cookie = SimpleCookie(self.headers.get("Cookie", ""))
+        session_cookie = cookie.get("megacoin_session")
+        if session_cookie is None:
+            return None
+        return self.server.node.get_user_from_session(session_cookie.value)
+
+    def require_user(self) -> dict[str, Any]:
+        user = self.current_user()
+        if user is None:
+            raise PermissionError("Authentication required.")
+        self.server.node.register_user_wallet_if_missing(user["id"])
+        return user
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
@@ -387,6 +534,29 @@ class MegaCoinHandler(BaseHTTPRequestHandler):
         if path == "/explorer":
             self.respond_html((STATIC_DIR / "explorer.html").read_text(encoding="utf-8"))
             return
+        if path == "/session":
+            user = self.current_user()
+            if user is None:
+                self.respond({"authenticated": False}, status=HTTPStatus.UNAUTHORIZED)
+                return
+            self.respond({"authenticated": True, "user": user, "wallet": self.server.node.wallet_payload(user["id"])})
+            return
+        if path == "/me/wallet":
+            try:
+                user = self.require_user()
+            except PermissionError as exc:
+                self.respond({"error": str(exc)}, status=HTTPStatus.UNAUTHORIZED)
+                return
+            self.respond(self.server.node.wallet_payload(user["id"]))
+            return
+        if path == "/me/history":
+            try:
+                user = self.require_user()
+            except PermissionError as exc:
+                self.respond({"error": str(exc)}, status=HTTPStatus.UNAUTHORIZED)
+                return
+            self.respond({"items": self.server.node.history_for_user(user["id"])})
+            return
         if path == "/chain":
             self.respond(self.server.node.blockchain.to_dict())
             return
@@ -399,6 +569,7 @@ class MegaCoinHandler(BaseHTTPRequestHandler):
                     "blocks": len(self.server.node.blockchain.chain),
                     "pending_transactions": len(self.server.node.blockchain.pending_transactions),
                     "peers": sorted(self.server.node.peers),
+                    "websocket_port": self.server.node.live_feed.actual_port,
                 }
             )
             return
@@ -493,6 +664,41 @@ class MegaCoinHandler(BaseHTTPRequestHandler):
         payload = self.read_json()
         client = self.client_address[0]
         try:
+            if path == "/register":
+                self.server.node.check_rate_limit(client, "register", 20)
+                result = self.server.node.create_user(payload["username"], payload["password"])
+                self.respond(
+                    {"user": result["user"], "wallet": result["wallet"]},
+                    status=HTTPStatus.CREATED,
+                    cookies=[self.session_cookie(result["session"])],
+                )
+                return
+            if path == "/login":
+                self.server.node.check_rate_limit(client, "login", 30)
+                result = self.server.node.authenticate_user(payload["username"], payload["password"])
+                self.respond(
+                    {"user": result["user"], "wallet": result["wallet"]},
+                    cookies=[self.session_cookie(result["session"])],
+                )
+                return
+            if path == "/logout":
+                cookie = SimpleCookie(self.headers.get("Cookie", ""))
+                session_cookie = cookie.get("megacoin_session")
+                if session_cookie is not None:
+                    self.server.node.destroy_session(session_cookie.value)
+                self.respond({"status": "logged_out"}, cookies=[self.clear_session_cookie()])
+                return
+            if path == "/me/send":
+                self.server.node.check_rate_limit(client, "wallet-send", 20)
+                user = self.require_user()
+                result = self.server.node.me_send(
+                    user["id"],
+                    recipient=payload["recipient"],
+                    amount=float(payload["amount"]),
+                    reference=payload.get("reference", ""),
+                )
+                self.respond(result, status=HTTPStatus.CREATED)
+                return
             if path == "/wallets/create":
                 self.server.node.check_rate_limit(client, "wallet-create", 20)
                 wallet = self.server.node.create_wallet(payload.get("owner", "MegaCoin User"))
@@ -549,6 +755,9 @@ class MegaCoinHandler(BaseHTTPRequestHandler):
                         payload.get("reference", "airdrop"),
                     )
                     self.server.node.refresh_invoice_states()
+                    self.server.node.auth.rebuild_transaction_history()
+                    self.server.node.persist_state()
+                self.server.node.publish_event("block", {"index": block.index, "hash": block.hash})
                 self.respond(block.to_dict(), status=HTTPStatus.CREATED)
                 return
             if path == "/merchant/invoices":
@@ -572,6 +781,9 @@ class MegaCoinHandler(BaseHTTPRequestHandler):
                     ):
                         self.server.node.blockchain.create_transaction(transaction)
                         self.server.node.refresh_invoice_states()
+                        self.server.node.auth.rebuild_transaction_history()
+                        self.server.node.persist_state()
+                        self.server.node.publish_event("transaction", {"tx_id": transaction.tx_id(), "reference": transaction.reference})
                 self.respond({"status": "accepted"})
                 return
             if path == "/peers/stakes":
@@ -579,6 +791,7 @@ class MegaCoinHandler(BaseHTTPRequestHandler):
                 with self.server.node.lock:
                     self.server.node.blockchain.stakes.setdefault(peer_payload["address"], 0.0)
                     self.server.node.blockchain.stakes[peer_payload["address"]] += float(peer_payload["amount"])
+                    self.server.node.persist_state()
                 self.respond({"status": "updated"})
                 return
             if path == "/peers/blocks":
@@ -587,6 +800,9 @@ class MegaCoinHandler(BaseHTTPRequestHandler):
                 with self.server.node.lock:
                     self.server.node.blockchain.apply_external_block(block)
                     self.server.node.refresh_invoice_states()
+                    self.server.node.auth.rebuild_transaction_history()
+                    self.server.node.persist_state()
+                    self.server.node.publish_event("block", {"index": block.index, "hash": block.hash})
                 self.respond({"status": "accepted"})
                 return
             if path == "/peers/discovery":
@@ -598,6 +814,9 @@ class MegaCoinHandler(BaseHTTPRequestHandler):
         except (KeyError, TypeError, ValueError) as exc:
             self.respond({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
+        except PermissionError as exc:
+            self.respond({"error": str(exc)}, status=HTTPStatus.UNAUTHORIZED)
+            return
         self.respond({"error": "Not found."}, status=HTTPStatus.NOT_FOUND)
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -608,11 +827,27 @@ class MegaCoinHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length).decode("utf-8") if length else "{}"
         return json.loads(raw or "{}")
 
-    def respond(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
+    def session_cookie(self, token: str) -> str:
+        return (
+            f"megacoin_session={token}; Path=/; Max-Age={SESSION_TTL_SECONDS}; "
+            "HttpOnly; SameSite=Lax"
+        )
+
+    def clear_session_cookie(self) -> str:
+        return "megacoin_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"
+
+    def respond(
+        self,
+        payload: dict[str, Any],
+        status: HTTPStatus = HTTPStatus.OK,
+        cookies: Optional[list[str]] = None,
+    ) -> None:
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        for cookie in cookies or []:
+            self.send_header("Set-Cookie", cookie)
         self.end_headers()
         self.wfile.write(body)
 
@@ -636,6 +871,7 @@ def create_server(host: str, port: int, node: Optional[Node] = None) -> Threadin
     server = ThreadingHTTPServer((host, port), MegaCoinHandler)
     server.node = node or Node(host, port)
     server.node.set_public_url(host, server.server_port)
+    server.node.live_feed.start()
     return server
 
 
@@ -662,6 +898,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        node.live_feed.stop()
         server.server_close()
 
 

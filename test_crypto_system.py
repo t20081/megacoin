@@ -8,8 +8,10 @@ import unittest
 import urllib.request
 from pathlib import Path
 
+from websockets.sync.client import connect as ws_connect
+
 from crypto_system import Blockchain, Transaction, Wallet
-from node_server import create_server, http_json
+from node_server import Node, create_server, http_json
 
 
 class CryptoSystemTests(unittest.TestCase):
@@ -82,20 +84,24 @@ class CryptoSystemTests(unittest.TestCase):
 
 class NodeIntegrationTests(unittest.TestCase):
     def start_server(self):
-        server = create_server("127.0.0.1", 0)
+        temp_dir = tempfile.TemporaryDirectory()
+        db_path = Path(temp_dir.name) / "megacoin.db"
+        server = create_server("127.0.0.1", 0, node=Node("127.0.0.1", 0, db_path=db_path))
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         time.sleep(0.1)
-        return server, thread, f"http://127.0.0.1:{server.server_port}"
+        return server, thread, f"http://127.0.0.1:{server.server_port}", temp_dir
 
-    def stop_server(self, server, thread):
+    def stop_server(self, server, thread, temp_dir):
         server.shutdown()
+        server.node.live_feed.stop()
         server.server_close()
         thread.join(timeout=2)
+        temp_dir.cleanup()
 
     def test_peer_sync_cli_invoice_and_web_routes(self) -> None:
-        server_a, thread_a, node_a = self.start_server()
-        server_b, thread_b, node_b = self.start_server()
+        server_a, thread_a, node_a, temp_a = self.start_server()
+        server_b, thread_b, node_b, temp_b = self.start_server()
         try:
             http_json(f"{node_b}/peers", method="POST", payload={"peer": node_a})
             peers_a = http_json(f"{node_a}/peers/list")
@@ -270,11 +276,11 @@ class NodeIntegrationTests(unittest.TestCase):
                 balance_payload = json.loads(balance_output)
                 self.assertEqual(balance_payload["balance"], 5.0)
         finally:
-            self.stop_server(server_a, thread_a)
-            self.stop_server(server_b, thread_b)
+            self.stop_server(server_a, thread_a, temp_a)
+            self.stop_server(server_b, thread_b, temp_b)
 
     def test_expired_invoice_timeout_handling(self) -> None:
-        server, thread, node = self.start_server()
+        server, thread, node, temp_dir = self.start_server()
         try:
             merchant = http_json(f"{node}/wallets/create", method="POST", payload={"owner": "Merchant"})
             invoice = http_json(
@@ -295,7 +301,125 @@ class NodeIntegrationTests(unittest.TestCase):
             listed = http_json(f"{node}/merchant/invoices")
             self.assertEqual(listed["invoices"][0]["status"], "expired")
         finally:
-            self.stop_server(server, thread)
+            self.stop_server(server, thread, temp_dir)
+
+    def test_user_register_login_and_history(self) -> None:
+        server, thread, node, temp_dir = self.start_server()
+        try:
+            opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
+            register_request = urllib.request.Request(
+                f"{node}/register",
+                data=json.dumps({"username": "alice", "password": "password123"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            register_payload = json.loads(opener.open(register_request).read().decode("utf-8"))
+            alice_address = register_payload["wallet"]["address"]
+
+            merchant_request = urllib.request.Request(
+                f"{node}/register",
+                data=json.dumps({"username": "merchant", "password": "password123"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            merchant_payload = json.loads(opener.open(merchant_request).read().decode("utf-8"))
+            merchant_address = merchant_payload["wallet"]["address"]
+
+            http_json(
+                f"{node}/airdrop",
+                method="POST",
+                payload={"recipient": alice_address, "amount": 25.0, "reference": "signup-bonus"},
+            )
+
+            login_request = urllib.request.Request(
+                f"{node}/login",
+                data=json.dumps({"username": "alice", "password": "password123"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            opener.open(login_request).read()
+
+            wallet_payload = json.loads(opener.open(f"{node}/me/wallet").read().decode("utf-8"))
+            self.assertEqual(wallet_payload["address"], alice_address)
+            self.assertEqual(wallet_payload["balance"], 25.0)
+
+            send_request = urllib.request.Request(
+                f"{node}/me/send",
+                data=json.dumps(
+                    {"recipient": merchant_address, "amount": 4.0, "reference": "first-order"}
+                ).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            send_payload = json.loads(opener.open(send_request).read().decode("utf-8"))
+            self.assertEqual(send_payload["status"], "accepted")
+
+            history_payload = json.loads(opener.open(f"{node}/me/history").read().decode("utf-8"))
+            self.assertEqual(len(history_payload["items"]), 2)
+            self.assertEqual(history_payload["items"][0]["status"], "pending")
+
+            wallet_html = opener.open(f"{node}/wallet").read().decode("utf-8")
+            self.assertIn("Personal account, personal wallet, live history.", wallet_html)
+        finally:
+            self.stop_server(server, thread, temp_dir)
+
+    def test_blockchain_state_persists_across_restart(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        db_path = Path(temp_dir.name) / "megacoin.db"
+        server = create_server("127.0.0.1", 0, node=Node("127.0.0.1", 0, db_path=db_path))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        time.sleep(0.1)
+        node_url = f"http://127.0.0.1:{server.server_port}"
+        try:
+            alice = http_json(f"{node_url}/wallets/create", method="POST", payload={"owner": "Alice"})
+            validator = http_json(f"{node_url}/wallets/create", method="POST", payload={"owner": "Validator"})
+            http_json(f"{node_url}/airdrop", method="POST", payload={"recipient": alice["address"], "amount": 10})
+            http_json(f"{node_url}/airdrop", method="POST", payload={"recipient": validator["address"], "amount": 15})
+            http_json(f"{node_url}/stake", method="POST", payload={"address": validator["address"], "amount": 10})
+            http_json(f"{node_url}/forge", method="POST", payload={})
+        finally:
+            server.shutdown()
+            server.node.live_feed.stop()
+            server.server_close()
+            thread.join(timeout=2)
+
+        server2 = create_server("127.0.0.1", 0, node=Node("127.0.0.1", 0, db_path=db_path))
+        thread2 = threading.Thread(target=server2.serve_forever, daemon=True)
+        thread2.start()
+        time.sleep(0.1)
+        node_url2 = f"http://127.0.0.1:{server2.server_port}"
+        try:
+            status = http_json(f"{node_url2}/status")
+            self.assertGreaterEqual(status["blocks"], 4)
+            chain = http_json(f"{node_url2}/chain")
+            self.assertEqual(chain["consensus"], "proof-of-stake")
+        finally:
+            server2.shutdown()
+            server2.node.live_feed.stop()
+            server2.server_close()
+            thread2.join(timeout=2)
+            temp_dir.cleanup()
+
+    def test_websocket_receives_live_transaction_event(self) -> None:
+        server, thread, node, temp_dir = self.start_server()
+        try:
+            status = http_json(f"{node}/status")
+            ws_url = f"ws://127.0.0.1:{status['websocket_port']}"
+            alice = http_json(f"{node}/wallets/create", method="POST", payload={"owner": "Alice"})
+            bob = http_json(f"{node}/wallets/create", method="POST", payload={"owner": "Bob"})
+            http_json(f"{node}/airdrop", method="POST", payload={"recipient": alice["address"], "amount": 12})
+
+            with ws_connect(ws_url) as websocket:
+                websocket.recv()
+                tx = Transaction(sender=alice["address"], recipient=bob["address"], amount=2.0)
+                wallet = Wallet(owner=alice["owner"], public_key_hex=alice["public_key_hex"], private_key_hex=alice["private_key_hex"])
+                tx.sign(wallet)
+                http_json(f"{node}/transactions", method="POST", payload=tx.to_dict())
+                event = json.loads(websocket.recv(timeout=2))
+                self.assertEqual(event["event"], "transaction")
+        finally:
+            self.stop_server(server, thread, temp_dir)
 
 
 if __name__ == "__main__":
